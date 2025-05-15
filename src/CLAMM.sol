@@ -6,6 +6,7 @@ import {TickMath} from "@v3-core/contracts/libraries/TickMath.sol";
 import {Position} from "@v3-core/contracts/libraries/Position.sol";
 import {SafeCast} from "@v3-core/contracts/libraries/SafeCast.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SqrtPriceMath} from "@v3-core/contracts/libraries/SqrtPriceMath.sol";
 
 function checkTicks(int24 tickLower, int24 tickUpper) pure {
     require(tickLower < tickUpper, "tickLower >= tickUpper");
@@ -39,6 +40,7 @@ contract CLAMM {
     }
 
     Slot0 public slot0;
+    uint128 public liquidity;
     mapping(int24 => Tick.Info) public ticks;
     mapping(bytes32 => Position.Info) public positions;
 
@@ -103,7 +105,36 @@ contract CLAMM {
 
         position = _updatePosition(params.owner, params.tickLower, params.tickUpper, params.liquidityDelta, _slot0.tick);
 
-        return (positions[bytes32(0)], 0, 0);
+        if(params.liquidityDelta != 0) {
+            if(_slot0.tick < params.tickLower) {
+                amount0 = SqrtPriceMath.getAmount0Delta(
+                    TickMath.getSqrtRatioAtTick(params.tickLower),
+                    TickMath.getSqrtRatioAtTick(params.tickUpper),
+                    params.liquidityDelta
+                );
+            } else if(_slot0.tick < params.tickUpper) {
+                amount0 = SqrtPriceMath.getAmount0Delta(
+                    slot0.sqrtPriceX96,
+                    TickMath.getSqrtRatioAtTick(params.tickUpper),
+                    params.liquidityDelta
+                );
+                amount1 = SqrtPriceMath.getAmount1Delta(
+                    TickMath.getSqrtRatioAtTick(params.tickLower),
+                    slot0.sqrtPriceX96,
+                    params.liquidityDelta
+                );
+
+                liquidity = params.liquidityDelta < 0
+                    ? liquidity - uint128(params.liquidityDelta)
+                    : liquidity + uint128(params.liquidityDelta);
+            } else {
+                amount1 = SqrtPriceMath.getAmount1Delta(
+                    TickMath.getSqrtRatioAtTick(params.tickLower),
+                    TickMath.getSqrtRatioAtTick(params.tickUpper),
+                    params.liquidityDelta
+                );
+            }
+        }
     }
 
     function mint(address recipient, int24 tickLower, int24 tickUpper, uint128 amount)
@@ -130,6 +161,41 @@ contract CLAMM {
 
         if (amount1 > 0) {
             IERC20(token1).transferFrom(msg.sender, address(this), amount1);
+        }
+    }
+
+    function collect(address recipient, int24 tickLower, int24 tickUpper, uint128 amount0Requested, uint128 amount1Requested) external lock returns(uint128 amount0, uint128 amount1){
+        Position.Info storage position = positions.get(msg.sender, tickLower, tickUpper);
+
+        amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
+        amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
+
+        if(amount0 > 0) {
+            position.tokensOwed0 -= amount0;
+            IERC20(token0).transfer(recipient, amount0);
+        }
+
+        if(amount1 > 0) {
+            position.tokensOwed1 -= amount1;
+            IERC20(token1).transfer(recipient, amount1);
+        }
+    }
+
+    function burn(int24 tickLower, int24 tickUpper, uint128 amount) external lock returns(uint256 amount0, uint256 amount1) {
+        (Position.Info storage position, int256 amount0Int, int256 amount1Int) = _modifyPosition(
+            ModifyPositionParams({
+                owner: msg.sender,
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -int256(uint256(amount)).toInt128()
+            })
+        );
+
+        amount0 = uint256(-amount0Int);
+        amount1 = uint256(-amount1Int);
+
+        if (amount0 > 0 || amount1 > 0) {
+            (position.tokensOwed0, position.tokensOwed1) = (position.tokensOwed0 + uint128(amount0), position.tokensOwed1 - uint128(amount1));
         }
     }
 }

@@ -39,7 +39,32 @@ contract CLAMM {
         int128 liquidityDelta;
     }
 
+    struct SwapCache {
+        uint128 liquidityStart;
+    }
+
+    struct SwapState {
+        int256 amountSpecifiedRemaining;
+        int256 amountCalculated;
+        uint160 sqrtPriceX96;
+        int24 tick;
+        uint256 feeGrowthGlobalX128;
+        uint128 liquidity;
+    }
+
+    struct StepComputations {
+        uint160 sqrtPriceStartX96;
+        int24 tickNext;
+        bool initialized;
+        uint160 sqrtPriceNextX96;
+        uint256 amountIn;
+        uint256 amountOut;
+        uint256 feeAmount;
+    }
+
     Slot0 public slot0;
+    uint256 public feeGrowthGlobal0X128;
+    uint256 public feeGrowthGlobal1X128;
     uint128 public liquidity;
     mapping(int24 => Tick.Info) public ticks;
     mapping(bytes32 => Position.Info) public positions;
@@ -79,17 +104,38 @@ contract CLAMM {
 
         if (liquidityDelta != 0) {
             //TODO: Have to remove these zeroes.
-            flippedLower = ticks.update(tickLower, tick, liquidityDelta, _feeGrowthGlobal0X128, _feeGrowthGlobal1X128,0,0,0, false,maxLiquidityPerTick);
-            flippedUpper = ticks.update(tickUpper, tick, liquidityDelta, _feeGrowthGlobal0X128, _feeGrowthGlobal1X128,0,0,0, true,maxLiquidityPerTick);
-
+            flippedLower = ticks.update(
+                tickLower,
+                tick,
+                liquidityDelta,
+                _feeGrowthGlobal0X128,
+                _feeGrowthGlobal1X128,
+                0,
+                0,
+                0,
+                false,
+                maxLiquidityPerTick
+            );
+            flippedUpper = ticks.update(
+                tickUpper,
+                tick,
+                liquidityDelta,
+                _feeGrowthGlobal0X128,
+                _feeGrowthGlobal1X128,
+                0,
+                0,
+                0,
+                true,
+                maxLiquidityPerTick
+            );
         }
         position.update(liquidityDelta, 0, 0);
 
         if (liquidityDelta < 0) {
-            if(flippedLower) {
+            if (flippedLower) {
                 ticks.clear(tickLower);
             }
-            if(flippedUpper) {
+            if (flippedUpper) {
                 ticks.clear(tickUpper);
             }
         }
@@ -105,23 +151,19 @@ contract CLAMM {
 
         position = _updatePosition(params.owner, params.tickLower, params.tickUpper, params.liquidityDelta, _slot0.tick);
 
-        if(params.liquidityDelta != 0) {
-            if(_slot0.tick < params.tickLower) {
+        if (params.liquidityDelta != 0) {
+            if (_slot0.tick < params.tickLower) {
                 amount0 = SqrtPriceMath.getAmount0Delta(
                     TickMath.getSqrtRatioAtTick(params.tickLower),
                     TickMath.getSqrtRatioAtTick(params.tickUpper),
                     params.liquidityDelta
                 );
-            } else if(_slot0.tick < params.tickUpper) {
+            } else if (_slot0.tick < params.tickUpper) {
                 amount0 = SqrtPriceMath.getAmount0Delta(
-                    slot0.sqrtPriceX96,
-                    TickMath.getSqrtRatioAtTick(params.tickUpper),
-                    params.liquidityDelta
+                    slot0.sqrtPriceX96, TickMath.getSqrtRatioAtTick(params.tickUpper), params.liquidityDelta
                 );
                 amount1 = SqrtPriceMath.getAmount1Delta(
-                    TickMath.getSqrtRatioAtTick(params.tickLower),
-                    slot0.sqrtPriceX96,
-                    params.liquidityDelta
+                    TickMath.getSqrtRatioAtTick(params.tickLower), slot0.sqrtPriceX96, params.liquidityDelta
                 );
 
                 liquidity = params.liquidityDelta < 0
@@ -164,24 +206,34 @@ contract CLAMM {
         }
     }
 
-    function collect(address recipient, int24 tickLower, int24 tickUpper, uint128 amount0Requested, uint128 amount1Requested) external lock returns(uint128 amount0, uint128 amount1){
+    function collect(
+        address recipient,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 amount0Requested,
+        uint128 amount1Requested
+    ) external lock returns (uint128 amount0, uint128 amount1) {
         Position.Info storage position = positions.get(msg.sender, tickLower, tickUpper);
 
         amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
         amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
 
-        if(amount0 > 0) {
+        if (amount0 > 0) {
             position.tokensOwed0 -= amount0;
             IERC20(token0).transfer(recipient, amount0);
         }
 
-        if(amount1 > 0) {
+        if (amount1 > 0) {
             position.tokensOwed1 -= amount1;
             IERC20(token1).transfer(recipient, amount1);
         }
     }
 
-    function burn(int24 tickLower, int24 tickUpper, uint128 amount) external lock returns(uint256 amount0, uint256 amount1) {
+    function burn(int24 tickLower, int24 tickUpper, uint128 amount)
+        external
+        lock
+        returns (uint256 amount0, uint256 amount1)
+    {
         (Position.Info storage position, int256 amount0Int, int256 amount1Int) = _modifyPosition(
             ModifyPositionParams({
                 owner: msg.sender,
@@ -195,7 +247,75 @@ contract CLAMM {
         amount1 = uint256(-amount1Int);
 
         if (amount0 > 0 || amount1 > 0) {
-            (position.tokensOwed0, position.tokensOwed1) = (position.tokensOwed0 + uint128(amount0), position.tokensOwed1 - uint128(amount1));
+            (position.tokensOwed0, position.tokensOwed1) =
+                (position.tokensOwed0 + uint128(amount0), position.tokensOwed1 - uint128(amount1));
+        }
+    }
+
+    function swap(
+        address recipient,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata data
+    ) external lock returns (int256 amount0, int256 amount1) {
+        require(amountSpecified != 0);
+
+        Slot0 memory slot0Start = slot0;
+
+        require(
+            zeroForOne
+                ? sqrtPriceLimitX96 < slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 > TickMath.MIN_SQRT_RATIO
+                : sqrtPriceLimitX96 > slot0Start.sqrtPriceX96 && sqrtPriceLimitX96 < TickMath.MIN_SQRT_RATIO,
+            "invalid sqrt price limit"
+        );
+
+        SwapCache memory cache = SwapCache({liquidityStart: liquidity});
+
+        bool exactInput = amountSpecified > 0;
+
+        SwapState memory state =
+            SwapState({
+                amountSpecifiedRemaining: amountSpecified,
+                amountCalculated: 0,
+                sqrtPriceX96: slot0Start.sqrtPriceX96,
+                tick: slot0Start.tick,
+                feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128,
+                liquidity: cache.liquidityStart
+            });
+
+            while (true) {}
+
+            if(state.tick != slot0Start.tick) {
+                (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
+            } else {
+                slot0.sqrtPriceX96 = state.sqrtPriceX96;
+            }
+
+            if(cache.liquidityStart != state.liquidity) {
+                liquidity = state.liquidity;    
+            }
+
+            if(zeroForOne) {
+                feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+            } else {
+                feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+            }
+
+            (amount0, amount1) = zeroForOne == exactInput
+                ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
+                : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
+
+            if (zeroForOne) {
+                if (amount1 < 0) {
+                    IERC20(token1).transfer(recipient, uint256(-amount1));
+                    IERC20(token0).transferFrom(msg.sender, address(this), uint256(amount0));
+            } else {
+                if (amount0 < 0) {
+                    IERC20(token0).transfer(recipient, uint256(-amount0));
+                    IERC20(token1).transferFrom(msg.sender, address(this), uint256(amount1));
+                }
+            }
         }
     }
 }

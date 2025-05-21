@@ -7,6 +7,10 @@ import {Position} from "@v3-core/contracts/libraries/Position.sol";
 import {SafeCast} from "@v3-core/contracts/libraries/SafeCast.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SqrtPriceMath} from "@v3-core/contracts/libraries/SqrtPriceMath.sol";
+import {SwapMath} from "@v3-core/contracts/libraries/SwapMath.sol";
+import {TickBitmap} from "@v3-core/contracts/libraries/TickBitmap.sol";
+import {FullMath} from "@v3-core/contracts/libraries/FullMath.sol";
+import {FixedPoint128} from "@v3-core/contracts/libraries/FixedPoint128.sol";
 
 function checkTicks(int24 tickLower, int24 tickUpper) pure {
     require(tickLower < tickUpper, "tickLower >= tickUpper");
@@ -16,7 +20,9 @@ function checkTicks(int24 tickLower, int24 tickUpper) pure {
 
 contract CLAMM {
     using SafeCast for int256;
+    using SafeCast for uint256;
     using Position for mapping(bytes32 => Position.Info);
+    using TickBitmap for mapping(int16 => uint256);
     using Tick for mapping(int24 => Tick.Info);
     using Position for Position.Info;
 
@@ -67,6 +73,7 @@ contract CLAMM {
     uint256 public feeGrowthGlobal1X128;
     uint128 public liquidity;
     mapping(int24 => Tick.Info) public ticks;
+    mapping(int16 => uint256) public tickBitmap;
     mapping(bytes32 => Position.Info) public positions;
 
     modifier lock() {
@@ -128,6 +135,12 @@ contract CLAMM {
                 true,
                 maxLiquidityPerTick
             );
+            if (flippedLower) {
+                tickBitmap.flipTick(tickLower, tickSpacing);
+            }
+            if (flippedUpper) {
+                tickBitmap.flipTick(tickUpper, tickSpacing);
+            }
         }
         position.update(liquidityDelta, 0, 0);
 
@@ -256,8 +269,8 @@ contract CLAMM {
         address recipient,
         bool zeroForOne,
         int256 amountSpecified,
-        uint160 sqrtPriceLimitX96,
-        bytes calldata data
+        uint160 sqrtPriceLimitX96
+        // bytes calldata data
     ) external lock returns (int256 amount0, int256 amount1) {
         require(amountSpecified != 0);
 
@@ -270,51 +283,170 @@ contract CLAMM {
             "invalid sqrt price limit"
         );
 
-        SwapCache memory cache = SwapCache({liquidityStart: liquidity});
+    SwapCache memory cache = SwapCache({liquidityStart: liquidity});
 
-        bool exactInput = amountSpecified > 0;
+    // true = sell some specified amount of token in
+    // false = buy some specified amount of token out
+    bool exactInput = amountSpecified > 0;
 
-        SwapState memory state =
-            SwapState({
-                amountSpecifiedRemaining: amountSpecified,
-                amountCalculated: 0,
-                sqrtPriceX96: slot0Start.sqrtPriceX96,
-                tick: slot0Start.tick,
-                feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128,
-                liquidity: cache.liquidityStart
-            });
+        SwapState memory state = SwapState({
+            amountSpecifiedRemaining: amountSpecified,
+            amountCalculated: 0,
+            sqrtPriceX96: slot0Start.sqrtPriceX96,
+            tick: slot0Start.tick,
+            feeGrowthGlobalX128: zeroForOne
+                ? feeGrowthGlobal0X128
+                : feeGrowthGlobal1X128,
+            liquidity: cache.liquidityStart
+        });
 
-            while (true) {}
+        while (
+            state.amountSpecifiedRemaining != 0
+                && state.sqrtPriceX96 != sqrtPriceLimitX96
+        ) {
+            StepComputations memory step;
 
-            if(state.tick != slot0Start.tick) {
-                (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
-            } else {
-                slot0.sqrtPriceX96 = state.sqrtPriceX96;
+            step.sqrtPriceStartX96 = state.sqrtPriceX96;
+
+            // Get next tick
+            (step.tickNext, step.initialized) = tickBitmap
+                .nextInitializedTickWithinOneWord(
+                state.tick,
+                tickSpacing,
+                // zero for one --> price decreases --> lte
+                // one for zero --> price increases --> gt
+                zeroForOne
+            );
+
+            // Bound tick next
+            if (step.tickNext < TickMath.MIN_TICK) {
+                step.tickNext = TickMath.MIN_TICK;
+            } else if (step.tickNext > TickMath.MAX_TICK) {
+                step.tickNext = TickMath.MAX_TICK;
             }
 
-            if(cache.liquidityStart != state.liquidity) {
-                liquidity = state.liquidity;    
+            step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.tickNext);
+
+            (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount)
+            = SwapMath.computeSwapStep(
+                state.sqrtPriceX96,
+                // zero for one --> max(next, limit)
+                // one for zero --> min(next, limit)
+                (
+                    zeroForOne
+                        ? step.sqrtPriceNextX96 < sqrtPriceLimitX96
+                        : step.sqrtPriceNextX96 > sqrtPriceLimitX96
+                ) ? sqrtPriceLimitX96 : step.sqrtPriceNextX96,
+                state.liquidity,
+                state.amountSpecifiedRemaining,
+                fee
+            );
+
+            if (exactInput) {
+                // Decreases to 0
+                state.amountSpecifiedRemaining -=
+                    (step.amountIn + step.feeAmount).toInt256();
+                state.amountCalculated -= step.amountOut.toInt256();
+            } else {
+                // Increases to 0
+                state.amountSpecifiedRemaining += step.amountOut.toInt256();
+                state.amountCalculated +=
+                    (step.amountIn + step.feeAmount).toInt256();
             }
 
-            if(zeroForOne) {
-                feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
-            } else {
-                feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+            if (state.liquidity > 0) {
+                // fee growth += fee amount * (1 << 128) / liquidity
+                state.feeGrowthGlobalX128 += FullMath.mulDiv(
+                    step.feeAmount, FixedPoint128.Q128, state.liquidity
+                );
             }
 
-            (amount0, amount1) = zeroForOne == exactInput
-                ? (amountSpecified - state.amountSpecifiedRemaining, state.amountCalculated)
-                : (state.amountCalculated, amountSpecified - state.amountSpecifiedRemaining);
+            // shift tick if we reached the next price
+            if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
+                if (step.initialized) {
+                    int128 liquidityNet = ticks.cross(
+                        step.tickNext,
+                        zeroForOne
+                            ? state.feeGrowthGlobalX128
+                            : feeGrowthGlobal0X128,
+                        zeroForOne
+                            ? feeGrowthGlobal1X128
+                            : state.feeGrowthGlobalX128,
+                            0,0,0
+                    );
 
-            if (zeroForOne) {
-                if (amount1 < 0) {
-                    IERC20(token1).transfer(recipient, uint256(-amount1));
-                    IERC20(token0).transferFrom(msg.sender, address(this), uint256(amount0));
-            } else {
-                if (amount0 < 0) {
-                    IERC20(token0).transfer(recipient, uint256(-amount0));
-                    IERC20(token1).transferFrom(msg.sender, address(this), uint256(amount1));
+                    if (zeroForOne) {
+                        liquidityNet = -liquidityNet;
+                    }
+
+                    state.liquidity = liquidityNet < 0
+                        ? state.liquidity - uint128(-liquidityNet)
+                        : state.liquidity + uint128(liquidityNet);
                 }
+                // zeroForOne = true --> tickNext <= state.tick
+                // if tickNext = state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                // if tickNext < state.tick --> nextInitializedTick = tickNext, so -1 to get next tick
+                state.tick = zeroForOne ? step.tickNext - 1 : step.tickNext;
+            } else if (state.sqrtPriceX96 != step.sqrtPriceStartX96) {
+                // state.sqrtPriceX96 is still in between 2 initialized ticks
+                // Recompute tick
+                state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
+            }
+        }
+
+        // Update sqrtPriceX96 and tick
+        if (state.tick != slot0Start.tick) {
+            (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
+        } else {
+            slot0.sqrtPriceX96 = state.sqrtPriceX96;
+        }
+
+        // Update liquidity
+        if (cache.liquidityStart != state.liquidity) {
+            liquidity = state.liquidity;
+        }
+
+        // Update fee growth
+        if (zeroForOne) {
+            feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+        } else {
+            feeGrowthGlobal1X128 = state.feeGrowthGlobalX128;
+        }
+
+        // Set amount0 and amount1
+        // zero for one | exact input |
+        //    true      |    true     | amount 0 = specified - remaining (> 0)
+        //              |             | amount 1 = calculated            (< 0)
+        //    false     |    false    | amount 0 = specified - remaining (< 0)
+        //              |             | amount 1 = calculated            (> 0)
+        //    false     |    true     | amount 0 = calculated            (< 0)
+        //              |             | amount 1 = specified - remaining (> 0)
+        //    true      |    false    | amount 0 = calculated            (> 0)
+        //              |             | amount 1 = specified - remaining (< 0)
+        (amount0, amount1) = zeroForOne == exactInput
+            ? (
+                amountSpecified - state.amountSpecifiedRemaining,
+                state.amountCalculated
+            )
+            : (
+                state.amountCalculated,
+                amountSpecified - state.amountSpecifiedRemaining
+            );
+
+        // Transfer tokens
+        if (zeroForOne) {
+            if (amount1 < 0) {
+                IERC20(token1).transfer(recipient, uint256(-amount1));
+                IERC20(token0).transferFrom(
+                    msg.sender, address(this), uint256(amount0)
+                );
+            }
+        } else {
+            if (amount0 < 0) {
+                IERC20(token0).transfer(recipient, uint256(-amount0));
+                IERC20(token1).transferFrom(
+                    msg.sender, address(this), uint256(amount1)
+                );
             }
         }
     }
